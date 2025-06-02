@@ -3,7 +3,7 @@ import os
 import pickle
 import sys
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import cv2
 import numpy as np
 
@@ -115,51 +115,80 @@ async def recognize_face(file: UploadFile = File(...)):
         logger.error(f"Error in recognize_face: {str(e)}")
         raise HTTPException(status_code=400, detail={"status": "error", "message": str(e)})
 
-@app.websocket("/video_feed")
-async def video_feed(websocket: WebSocket):
-    await websocket.accept()
-    cap = cv2.VideoCapture(0)
+@app.post("/recognize_image")
+async def recognize_image(file: UploadFile = File(...)):
+    # Log received file details for debugging
+    logger.info(f"Received file: {file.filename}")
+    logger.info(f"Content-Type: {file.content_type}")
+    logger.info(f"File size: {file.size}")
+    
+    # Accept multiple image formats - be more permissive
+    allowed_types = [
+        "image/jpeg", "image/jpg", "image/png", 
+        "image/heic", "image/webp", "image/bmp",
+        "application/octet-stream"  # Sometimes mobile apps send this
+    ]
+    
+    # Also check file extension if content-type is not reliable
+    allowed_extensions = ['.jpg', '.jpeg', '.png', '.heic', '.webp', '.bmp']
+    file_extension = None
+    if file.filename:
+        file_extension = os.path.splitext(file.filename.lower())[1]
+    
+    # Check both content type and file extension
+    content_type_valid = file.content_type in allowed_types
+    extension_valid = file_extension in allowed_extensions if file_extension else False
+    
+    if not content_type_valid and not extension_valid:
+        error_msg = f"Unsupported file. Content-Type: {file.content_type}, Extension: {file_extension}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=400, detail=error_msg)
+    
     try:
-        while True:
-            success, frame = cap.read()
-            if not success:
-                break
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            user_id = recognizer.recognize(frame)
-            result = {"status": "unknown", "user_id": None, "name": None}
-
-            if user_id:
-                result["status"] = "success"
-                result["user_id"] = user_id
-                 # Extract numeric ID
-                employee_id = int(user_id.replace('user_', ''))
-                  # Call NestJS API with error handling
-                response = requests.get(
-                        f"{NESTJS_API_URL}/employees/{employee_id}",
-                        timeout=3  # Add timeout
-                    )
+        # Read image bytes
+        contents = await file.read()
+        
+        # Add validation for empty file
+        if not contents:
+            raise HTTPException(status_code=400, detail="Empty file received")
+        
+        logger.info(f"File contents size: {len(contents)} bytes")
+        
+        np_arr = np.frombuffer(contents, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            logger.error("Could not decode image - invalid image data")
+            raise HTTPException(status_code=400, detail="Invalid image data - could not decode")
+        
+        logger.info(f"Image decoded successfully. Shape: {frame.shape}")
+        
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Recognize the user (assuming your recognizer logic is the same)
+        user_id = recognizer.recognize(frame) # Make sure recognizer is defined
+        
+        result = {"status": "unknown", "user_id": None, "name": None}
+        
+        if user_id:
+            result["status"] = "success"
+            result["user_id"] = user_id
+            employee_id = int(user_id.replace('user_', ''))
+            
+            try:
+                response = requests.get(f"{NESTJS_API_URL}/employees/{employee_id}", timeout=3)
                 if response.status_code == 200:
                     user_data = response.json()
-                    result = {
-                            "status": "success",
-                            "user_id": user_data["id"],
-                            "name": user_data["name"]  # Directly access name field
-                        }
-                    # Display on frame
-                    cv2.putText(frame, f"ID: {employee_id}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(frame, f"Name: {user_data['name']}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, f"User: {user_id}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            else:
-                cv2.putText(frame, "Unknown", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-            ret, buffer = cv2.imencode('.jpg', frame)
-            await websocket.send_json(result)
-            await websocket.send_bytes(buffer.tobytes())
+                    result["user_id"] = user_data["id"]
+                    result["name"] = user_data["name"]
+            except requests.RequestException as e:
+                logger.error(f"Error contacting NestJS API: {e}")
+        
+        return JSONResponse(content=result)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Error in video_feed: {str(e)}")
-        await websocket.close()
-    finally:
-        cap.release()
-        
-        
+        logger.error(f"Error in recognize_image: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
